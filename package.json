@@ -1,6 +1,6 @@
 {
   "name": "omp-patch",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "oh-my-pi extension: auto-continue after resource_exhausted and stream stall/timeout failures",
   "license": "MIT",
   "repository": {

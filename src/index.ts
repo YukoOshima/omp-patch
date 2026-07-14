@@ -5,18 +5,14 @@
  * auto-retry sometimes fail-fasts on:
  *
  * - Cursor Connect `resource_exhausted` (misclassified as 30m quota → maxDelayMs fail-fast)
- * - Stream idle stall: "...stream stalled while waiting for the next event"
- * - First-event timeout: "...timed out while waiting for the first event"
- * - Thinking-loop stalls that advertise themselves as "stream stall"
+ * - Stream idle stall / first-event timeout / thinking-loop "stream stall"
  *
- * Extension APIs cannot rewrite parseRateLimitReason or the idle watchdog.
- * This only recovers after session_stop when the last assistant message is an
- * error matching the patterns above.
+ * Important: omp skips `session_stop` when the failed assistant message still
+ * contains toolCall blocks (common for Cursor mid-turn resource_exhausted).
+ * This extension therefore recovers primarily from `agent_end`, with
+ * `session_stop` kept as a fallback for text-only error settles.
  *
  * Backoff: ~5s first continue, then ~45–75s. Cap: 3 consecutive continues.
- *
- * Note: providers.streamIdleTimeoutSeconds / streamFirstEventTimeoutSeconds
- * must be > 0 for stall/first-event timeouts to fire (0 disables the watchdog).
  */
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
@@ -25,7 +21,6 @@ const FIRST_DELAY_MS = 5_000;
 const CAPACITY_BASE_MS = 45_000;
 const CAPACITY_JITTER_MS = 30_000;
 
-/** Failures worth a short continue rather than leaving the session idle. */
 const TRANSIENT_FAILURE_RE =
 	/resource[\s_]?exhausted|exceeds retry\.maxDelayMs|stream stalled|timed out while waiting for the first event|stream stall/i;
 
@@ -47,6 +42,15 @@ function isTransientStreamFailure(message: unknown): boolean {
 	return TRANSIENT_FAILURE_RE.test(m.errorMessage ?? "");
 }
 
+function lastAssistant(messages: unknown[] | undefined): unknown {
+	if (!Array.isArray(messages)) return undefined;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const m = messages[i] as { role?: string } | undefined;
+		if (m?.role === "assistant") return m;
+	}
+	return undefined;
+}
+
 function continueHint(err: string): string {
 	if (/resource[\s_]?exhausted|exceeds retry\.maxDelayMs/i.test(err)) {
 		return "The previous turn failed on a transient Cursor/Connect resource_exhausted (model capacity) error. Continue the interrupted work from where you left off; do not ask the user to restate the request.";
@@ -62,35 +66,25 @@ export default function transientStreamRetry(pi: ExtensionAPI): void {
 
 	let consecutive = 0;
 	let inFlight = false;
+	/** Prevent agent_end + session_stop from both scheduling a continue. */
+	let handledErrorKey: string | undefined;
 
-	pi.on("turn_end", async event => {
-		const last = event.message;
-		if (last?.role === "assistant" && last.stopReason !== "error") {
-			consecutive = 0;
-		}
-	});
-
-	pi.on("auto_retry_end", async (event, ctx) => {
-		if (event.success) {
-			consecutive = 0;
-			return;
-		}
-		const err = event.finalError ?? "";
-		if (!TRANSIENT_FAILURE_RE.test(err)) return;
-		if (ctx.hasUI) {
-			ctx.ui.notify(
-				`Transient stream/provider fail-fast (attempt ${event.attempt}); will try session continue if idle`,
-				"warning",
-			);
-		}
-	});
-
-	pi.on("session_stop", async (event, ctx: ExtensionContext) => {
+	const scheduleContinue = async (
+		message: unknown,
+		ctx: ExtensionContext,
+		via: "agent_end" | "session_stop",
+	): Promise<{ continue: true; additionalContext: string } | undefined> => {
 		if (inFlight) return;
-		if (!isTransientStreamFailure(event.last_assistant_message)) {
+		if (!isTransientStreamFailure(message)) {
 			consecutive = 0;
+			handledErrorKey = undefined;
 			return;
 		}
+
+		const err = errorText(message) || "transient stream error";
+		const stamp = String((message as { timestamp?: number }).timestamp ?? "");
+		const dedupeKey = `${err}:${stamp}`;
+		if (handledErrorKey === dedupeKey) return;
 
 		if (consecutive >= MAX_CONTINUATIONS) {
 			if (ctx.hasUI) {
@@ -101,12 +95,12 @@ export default function transientStreamRetry(pi: ExtensionAPI): void {
 		}
 
 		consecutive += 1;
+		handledErrorKey = dedupeKey;
 		const delayMs = Math.round(capacityDelayMs(consecutive));
-		const err = errorText(event.last_assistant_message) || "transient stream error";
 
 		if (ctx.hasUI) {
 			ctx.ui.notify(
-				`omp-patch: ${err.slice(0, 80)} — retrying in ${Math.round(delayMs / 1000)}s (${consecutive}/${MAX_CONTINUATIONS})`,
+				`omp-patch (${via}): ${err.slice(0, 70)} — retrying in ${Math.round(delayMs / 1000)}s (${consecutive}/${MAX_CONTINUATIONS})`,
 				"warning",
 			);
 		}
@@ -114,12 +108,59 @@ export default function transientStreamRetry(pi: ExtensionAPI): void {
 		inFlight = true;
 		try {
 			await Bun.sleep(delayMs);
-			return {
-				continue: true,
-				additionalContext: continueHint(err),
-			};
+			const additionalContext = continueHint(err);
+
+			if (via === "session_stop") {
+				return { continue: true, additionalContext };
+			}
+
+			// agent_end path: session_stop is often skipped when the failed
+			// assistant message still has toolCall blocks. Kick a turn ourselves.
+			pi.sendMessage(
+				{
+					customType: "omp-patch-retry",
+					content: additionalContext,
+					display: true,
+				},
+				{ triggerTurn: true, deliverAs: "nextTurn" },
+			);
 		} finally {
 			inFlight = false;
 		}
+	};
+
+	pi.on("turn_end", async event => {
+		const last = event.message;
+		if (last?.role === "assistant" && last.stopReason !== "error") {
+			consecutive = 0;
+			handledErrorKey = undefined;
+		}
+	});
+
+	pi.on("auto_retry_end", async (event, ctx) => {
+		if (event.success) {
+			consecutive = 0;
+			handledErrorKey = undefined;
+			return;
+		}
+		const err = event.finalError ?? "";
+		if (!TRANSIENT_FAILURE_RE.test(err)) return;
+		if (ctx.hasUI) {
+			ctx.ui.notify(
+				`omp-patch: fail-fast (${event.attempt}); waiting for agent_end/session_stop to continue`,
+				"warning",
+			);
+		}
+	});
+
+	// Primary recovery path — always emitted, even when session_stop is skipped.
+	pi.on("agent_end", async (event, ctx) => {
+		const message = lastAssistant(event.messages);
+		await scheduleContinue(message, ctx, "agent_end");
+	});
+
+	// Fallback for text-only error settles that do reach session_stop.
+	pi.on("session_stop", async (event, ctx: ExtensionContext) => {
+		return scheduleContinue(event.last_assistant_message, ctx, "session_stop");
 	});
 }

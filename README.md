@@ -9,7 +9,10 @@ oh-my-pi extension that auto-continues the main session after transient provider
 
 **Backoff:** ~5s on the first continue, then ~45–75s. **Cap:** 3 consecutive continues.
 
-This does **not** patch `parseRateLimitReason` inside omp — it recovers after `session_stop` when the last assistant message matches those error patterns.
+This does **not** patch `parseRateLimitReason` inside omp. Recovery hooks:
+
+1. **`agent_end` (primary)** — omp skips `session_stop` when the failed assistant message still contains `toolCall` blocks (common for Cursor `resource_exhausted`). This path uses `sendMessage({ triggerTurn: true })`.
+2. **`session_stop` (fallback)** — text-only error settles that do emit stop hooks.
 
 ## Install
 
