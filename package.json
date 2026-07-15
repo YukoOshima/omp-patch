@@ -1,16 +1,32 @@
 {
   "name": "omp-patch",
-  "version": "1.0.3",
-  "description": "oh-my-pi extension: stream retry (resource_exhausted/NGHTTP2/stall) + advisor reviewing UI",
+  "version": "1.0.8",
+  "description": "oh-my-pi extension: stream retry + advisor UI + compact tools + advisor autoresume",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/YukoOshima/omp-patch.git"
   },
   "homepage": "https://github.com/YukoOshima/omp-patch",
-  "keywords": ["oh-my-pi", "omp", "extension", "retry", "advisor", "resource_exhausted", "NGHTTP2", "stream-stall"],
+  "keywords": [
+    "oh-my-pi",
+    "omp",
+    "extension",
+    "retry",
+    "advisor",
+    "resource_exhausted",
+    "NGHTTP2",
+    "stream-stall",
+    "compact-tools",
+    "tool-ui",
+    "claude-code",
+    "advisor-autoresume",
+    "auto-continue"
+  ],
   "omp": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   },
   "peerDependencies": {
     "@oh-my-pi/pi-coding-agent": ">=16.0.0"

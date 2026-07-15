@@ -6,10 +6,19 @@
  * 2) Advisor presence UI — while advisors review a finished turn, show footer
  *    status + an above-editor widget (stock omp only shows a static "++" and
  *    Advisor cards after notes arrive).
+ * 3) Compact tool UI — Claude Code–style one-line tool results (Ctrl+O expands).
+ * 4) Advisor autoresume — when omp preserves a concern/blocker card after a
+ *    terminal text answer, auto-continue so the agent weighs and acts on it.
  */
 import { homedir } from "node:os";
 import { sep } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { installAdvisorAutoresume } from "./advisor-autoresume.ts";
+import {
+	installCompactToolUi,
+	isCompactToolsEnabled,
+	toggleCompactTools,
+} from "./compact-tools.ts";
 
 const MAX_CONTINUATIONS = 3;
 const FIRST_DELAY_MS = 5_000;
@@ -114,8 +123,41 @@ async function readAdvisorEnabled(ctx: ExtensionContext): Promise<boolean> {
 	}
 }
 
-export default function ompPatch(pi: ExtensionAPI): void {
+export default async function ompPatch(pi: ExtensionAPI): Promise<void> {
 	pi.setLabel("omp-patch");
+
+	// ——— compact tool UI (Claude Code–style) ———
+	const compact = installCompactToolUi(pi);
+	// Widen coverage (vibe/task/browser/…) when host toolRenderers is reachable.
+	const compactFinal = await compact.ready;
+	pi.registerCommand("compact-tools", {
+		description: "Toggle compact tool results (one-liner; Ctrl+O expands)",
+		handler: async (ctx) => {
+			const on = toggleCompactTools();
+			if (ctx.hasUI) {
+				ctx.ui.notify(`omp-patch: compact tools ${on ? "on" : "off"} — Ctrl+O expands`, "info");
+			}
+		},
+	});
+	pi.on("session_start", async (_event, ctx) => {
+		if (!ctx.hasUI) return;
+		const n = compactFinal.patched.length;
+		if (n > 0 && isCompactToolsEnabled()) {
+			if (!compactFinal.taskInstancePatched) {
+				throw new Error("omp-patch: compact tools loaded without TaskTool patch (should be unreachable)");
+			}
+			ctx.ui.setStatus(
+				"omp-patch-compact",
+				ctx.ui.theme.fg("dim", `compact tools · ${n} +task`),
+			);
+			setTimeout(() => {
+				if (ctx.hasUI) ctx.ui.setStatus("omp-patch-compact", undefined);
+			}, 4_000);
+		}
+	});
+
+	// ——— advisor autoresume (preserved concern/blocker cards) ———
+	installAdvisorAutoresume(pi);
 
 	// ——— transient stream retry ———
 	let consecutive = 0;
