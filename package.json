@@ -1,14 +1,14 @@
 {
   "name": "omp-patch",
-  "version": "1.0.1",
-  "description": "oh-my-pi extension: auto-continue after resource_exhausted and stream stall/timeout failures",
+  "version": "1.0.2",
+  "description": "oh-my-pi extension: auto-continue after resource_exhausted, NGHTTP2 stream resets, and stream stall/timeout failures",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/YukoOshima/omp-patch.git"
   },
   "homepage": "https://github.com/YukoOshima/omp-patch",
-  "keywords": ["oh-my-pi", "omp", "extension", "retry", "resource_exhausted", "stream-stall"],
+  "keywords": ["oh-my-pi", "omp", "extension", "retry", "resource_exhausted", "NGHTTP2", "stream-stall"],
   "omp": {
     "extensions": ["./src/index.ts"]
   },

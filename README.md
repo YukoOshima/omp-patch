@@ -3,6 +3,7 @@
 oh-my-pi extension that auto-continues the main session after transient provider/stream failures:
 
 - Cursor Connect `resource_exhausted` (stock classifier often fail-fasts via `retry.maxDelayMs`)
+- HTTP/2 stream resets: `Stream closed with error code NGHTTP2_INTERNAL_ERROR` (stock auto-retry skips when the failed turn already has `toolCall` blocks)
 - Stream idle stall: `...stream stalled while waiting for the next event`
 - First-event timeout: `...timed out while waiting for the first event`
 - Thinking-loop errors that include `stream stall`

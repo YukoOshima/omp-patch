@@ -2,15 +2,17 @@
  * omp-patch / transient-stream-retry
  *
  * Continues the main session after transient provider failures that stock
- * auto-retry sometimes fail-fasts on:
+ * auto-retry sometimes fail-fasts on or refuses to replay:
  *
  * - Cursor Connect `resource_exhausted` (misclassified as 30m quota → maxDelayMs fail-fast)
+ * - HTTP/2 stream resets: `NGHTTP2_INTERNAL_ERROR` / `Stream closed with error code …`
+ *   (stock auto-retry marks mid-toolCall failures as replayUnsafe and skips retry)
  * - Stream idle stall / first-event timeout / thinking-loop "stream stall"
  *
  * Important: omp skips `session_stop` when the failed assistant message still
- * contains toolCall blocks (common for Cursor mid-turn resource_exhausted).
- * This extension therefore recovers primarily from `agent_end`, with
- * `session_stop` kept as a fallback for text-only error settles.
+ * contains toolCall blocks (common for Cursor mid-turn resource_exhausted /
+ * NGHTTP2 cuts). This extension therefore recovers primarily from `agent_end`,
+ * with `session_stop` kept as a fallback for text-only error settles.
  *
  * Backoff: ~5s first continue, then ~45–75s. Cap: 3 consecutive continues.
  */
@@ -22,7 +24,7 @@ const CAPACITY_BASE_MS = 45_000;
 const CAPACITY_JITTER_MS = 30_000;
 
 const TRANSIENT_FAILURE_RE =
-	/resource[\s_]?exhausted|exceeds retry\.maxDelayMs|stream stalled|timed out while waiting for the first event|stream stall/i;
+	/resource[\s_]?exhausted|exceeds retry\.maxDelayMs|stream stalled|timed out while waiting for the first event|stream stall|NGHTTP2(?:_INTERNAL_ERROR)?|Stream closed with error code|HTTP2(?:StreamReset|INTERNAL_ERROR)/i;
 
 function capacityDelayMs(attempt: number): number {
 	if (attempt <= 1) return FIRST_DELAY_MS;
@@ -57,6 +59,9 @@ function continueHint(err: string): string {
 	}
 	if (/stalled|first event|stream stall/i.test(err)) {
 		return "The previous turn failed because the provider stream stalled or timed out waiting for events. Continue the interrupted work from where you left off; do not ask the user to restate the request.";
+	}
+	if (/NGHTTP2|Stream closed with error code|HTTP2(?:StreamReset|INTERNAL_ERROR)/i.test(err)) {
+		return "The previous turn failed on a transient HTTP/2 stream reset (e.g. NGHTTP2_INTERNAL_ERROR). Continue the interrupted work from where you left off; do not ask the user to restate the request.";
 	}
 	return "The previous turn failed on a transient provider/stream error. Continue the interrupted work from where you left off; do not ask the user to restate the request.";
 }
