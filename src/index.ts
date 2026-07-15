@@ -1,27 +1,25 @@
 /**
- * omp-patch / transient-stream-retry
+ * omp-patch
  *
- * Continues the main session after transient provider failures that stock
- * auto-retry sometimes fail-fasts on or refuses to replay:
- *
- * - Cursor Connect `resource_exhausted` (misclassified as 30m quota → maxDelayMs fail-fast)
- * - HTTP/2 stream resets: `NGHTTP2_INTERNAL_ERROR` / `Stream closed with error code …`
- *   (stock auto-retry marks mid-toolCall failures as replayUnsafe and skips retry)
- * - Stream idle stall / first-event timeout / thinking-loop "stream stall"
- *
- * Important: omp skips `session_stop` when the failed assistant message still
- * contains toolCall blocks (common for Cursor mid-turn resource_exhausted /
- * NGHTTP2 cuts). This extension therefore recovers primarily from `agent_end`,
- * with `session_stop` kept as a fallback for text-only error settles.
- *
- * Backoff: ~5s first continue, then ~45–75s. Cap: 3 consecutive continues.
+ * 1) Transient stream retry — auto-continue after failures stock omp often
+ *    refuses (resource_exhausted fail-fast, NGHTTP2 mid-toolCall, stream stall).
+ * 2) Advisor presence UI — while advisors review a finished turn, show footer
+ *    status + an above-editor widget (stock omp only shows a static "++" and
+ *    Advisor cards after notes arrive).
  */
+import { homedir } from "node:os";
+import { sep } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 const MAX_CONTINUATIONS = 3;
 const FIRST_DELAY_MS = 5_000;
 const CAPACITY_BASE_MS = 45_000;
 const CAPACITY_JITTER_MS = 30_000;
+
+/** How long to keep "Advisor reviewing…" if no notes arrive (silent finish). */
+const ADVISOR_SILENCE_MS = 120_000;
+const ADVISOR_STATUS_KEY = "omp-patch-advisor";
+const ADVISOR_WIDGET_KEY = "omp-patch-advisor";
 
 const TRANSIENT_FAILURE_RE =
 	/resource[\s_]?exhausted|exceeds retry\.maxDelayMs|stream stalled|timed out while waiting for the first event|stream stall|NGHTTP2(?:_INTERNAL_ERROR)?|Stream closed with error code|HTTP2(?:StreamReset|INTERNAL_ERROR)/i;
@@ -66,13 +64,158 @@ function continueHint(err: string): string {
 	return "The previous turn failed on a transient provider/stream error. Continue the interrupted work from where you left off; do not ask the user to restate the request.";
 }
 
-export default function transientStreamRetry(pi: ExtensionAPI): void {
+function isAdvisorCustomMessage(message: unknown): boolean {
+	if (!message || typeof message !== "object") return false;
+	const m = message as { customType?: string };
+	return m.customType === "advisor";
+}
+
+function advisorNoteCount(message: unknown): number | undefined {
+	if (!message || typeof message !== "object") return undefined;
+	const details = (message as { details?: { notes?: unknown[] } }).details;
+	if (!details || !Array.isArray(details.notes)) return undefined;
+	return details.notes.length;
+}
+
+function resolveAgentDir(ctx: ExtensionContext): string {
+	try {
+		const sessionFile = ctx.sessionManager.getSessionFile?.() as string | undefined;
+		if (sessionFile) {
+			const needle = `${sep}sessions${sep}`;
+			const cut = sessionFile.lastIndexOf(needle);
+			if (cut >= 0) return sessionFile.slice(0, cut);
+		}
+	} catch {
+		/* ignore */
+	}
+	return `${homedir()}/.omp/agent`;
+}
+
+/** Best-effort: top-level `advisor.enabled` in config.yml (assume on if unreadable). */
+async function readAdvisorEnabled(ctx: ExtensionContext): Promise<boolean> {
+	try {
+		const text = await Bun.file(`${resolveAgentDir(ctx)}/config.yml`).text();
+		const lines = text.split(/\r?\n/);
+		let inAdvisor = false;
+		for (const line of lines) {
+			if (/^advisor:\s*(?:#.*)?$/.test(line)) {
+				inAdvisor = true;
+				continue;
+			}
+			if (inAdvisor) {
+				if (/^\S/.test(line)) break;
+				const m = /^[ \t]+enabled:\s*(true|false)\b/.exec(line);
+				if (m) return m[1] === "true";
+			}
+		}
+		return true;
+	} catch {
+		return true;
+	}
+}
+
+export default function ompPatch(pi: ExtensionAPI): void {
 	pi.setLabel("omp-patch");
 
+	// ——— transient stream retry ———
 	let consecutive = 0;
 	let inFlight = false;
-	/** Prevent agent_end + session_stop from both scheduling a continue. */
 	let handledErrorKey: string | undefined;
+
+	// ——— advisor UI ———
+	let advisorPending = false;
+	let advisorStartedAt = 0;
+	let advisorSilenceTimer: ReturnType<typeof setTimeout> | undefined;
+	let advisorTickTimer: ReturnType<typeof setInterval> | undefined;
+	let lastUiCtx: ExtensionContext | undefined;
+
+	const clearAdvisorTimers = (): void => {
+		if (advisorSilenceTimer) {
+			clearTimeout(advisorSilenceTimer);
+			advisorSilenceTimer = undefined;
+		}
+		if (advisorTickTimer) {
+			clearInterval(advisorTickTimer);
+			advisorTickTimer = undefined;
+		}
+	};
+
+	const paintAdvisorUi = (
+		ctx: ExtensionContext,
+		mode: "reviewing" | "notes" | "silent" | "clear",
+		noteCount?: number,
+	): void => {
+		if (!ctx.hasUI) return;
+		const theme = ctx.ui.theme;
+		if (mode === "clear") {
+			ctx.ui.setStatus(ADVISOR_STATUS_KEY, undefined);
+			ctx.ui.setWidget(ADVISOR_WIDGET_KEY, undefined);
+			return;
+		}
+		if (mode === "reviewing") {
+			const elapsed = Math.max(0, Math.round((Date.now() - advisorStartedAt) / 1000));
+			const spin = theme.fg("accent", "◆");
+			ctx.ui.setStatus(ADVISOR_STATUS_KEY, `${spin}${theme.fg("dim", ` Advisor reviewing… ${elapsed}s`)}`);
+			ctx.ui.setWidget(
+				ADVISOR_WIDGET_KEY,
+				[
+					theme.fg("accent", "Advisor") + theme.fg("dim", " · reviewing the last turn"),
+					theme.fg(
+						"dim",
+						"Waiting for notes (or a silent finish). Agent Hub → advisor transcript for live detail.",
+					),
+				],
+				{ placement: "aboveEditor" },
+			);
+			return;
+		}
+		if (mode === "notes") {
+			const n = noteCount ?? 0;
+			const check = theme.fg("success", "✓");
+			ctx.ui.setStatus(ADVISOR_STATUS_KEY, `${check}${theme.fg("dim", ` Advisor · ${n} note${n === 1 ? "" : "s"}`)}`);
+			ctx.ui.setWidget(ADVISOR_WIDGET_KEY, undefined);
+			return;
+		}
+		const check = theme.fg("dim", "✓");
+		ctx.ui.setStatus(ADVISOR_STATUS_KEY, `${check}${theme.fg("dim", " Advisor · no notes")}`);
+		ctx.ui.setWidget(ADVISOR_WIDGET_KEY, undefined);
+	};
+
+	const stopAdvisorPending = (
+		ctx: ExtensionContext | undefined,
+		mode: "notes" | "silent" | "clear",
+		noteCount?: number,
+	): void => {
+		if (!advisorPending && mode === "clear") {
+			if (ctx?.hasUI) paintAdvisorUi(ctx, "clear");
+			return;
+		}
+		advisorPending = false;
+		clearAdvisorTimers();
+		const ui = ctx ?? lastUiCtx;
+		if (!ui?.hasUI) return;
+		paintAdvisorUi(ui, mode, noteCount);
+		if (mode === "notes" || mode === "silent") {
+			setTimeout(() => {
+				if (!advisorPending && ui.hasUI) paintAdvisorUi(ui, "clear");
+			}, 4_000);
+		}
+	};
+
+	const startAdvisorPending = (ctx: ExtensionContext): void => {
+		lastUiCtx = ctx;
+		advisorPending = true;
+		advisorStartedAt = Date.now();
+		clearAdvisorTimers();
+		paintAdvisorUi(ctx, "reviewing");
+		advisorTickTimer = setInterval(() => {
+			if (!advisorPending || !lastUiCtx?.hasUI) return;
+			paintAdvisorUi(lastUiCtx, "reviewing");
+		}, 1_000);
+		advisorSilenceTimer = setTimeout(() => {
+			stopAdvisorPending(lastUiCtx, "silent");
+		}, ADVISOR_SILENCE_MS);
+	};
 
 	const scheduleContinue = async (
 		message: unknown,
@@ -119,8 +262,6 @@ export default function transientStreamRetry(pi: ExtensionAPI): void {
 				return { continue: true, additionalContext };
 			}
 
-			// agent_end path: session_stop is often skipped when the failed
-			// assistant message still has toolCall blocks. Kick a turn ourselves.
 			pi.sendMessage(
 				{
 					customType: "omp-patch-retry",
@@ -134,12 +275,35 @@ export default function transientStreamRetry(pi: ExtensionAPI): void {
 		}
 	};
 
-	pi.on("turn_end", async event => {
+	pi.on("turn_end", async (event, ctx) => {
 		const last = event.message;
 		if (last?.role === "assistant" && last.stopReason !== "error") {
 			consecutive = 0;
 			handledErrorKey = undefined;
 		}
+		// Advisors kick off on each primary turn_end; stock UI only shows "++".
+		if (last?.role === "assistant" && (last.stopReason === "stop" || last.stopReason === "length")) {
+			if (await readAdvisorEnabled(ctx)) {
+				startAdvisorPending(ctx);
+			}
+		}
+	});
+
+	pi.on("message_end", async (event, ctx) => {
+		if (!isAdvisorCustomMessage(event.message)) return;
+		const n = advisorNoteCount(event.message);
+		stopAdvisorPending(ctx, "notes", n);
+		if (ctx.hasUI && n !== undefined) {
+			ctx.ui.notify(`Advisor returned ${n} note${n === 1 ? "" : "s"}`, "info");
+		}
+	});
+
+	pi.on("agent_start", async (_event, ctx) => {
+		if (advisorPending) stopAdvisorPending(ctx, "clear");
+	});
+
+	pi.on("session_switch", async (_event, ctx) => {
+		stopAdvisorPending(ctx, "clear");
 	});
 
 	pi.on("auto_retry_end", async (event, ctx) => {
@@ -158,13 +322,21 @@ export default function transientStreamRetry(pi: ExtensionAPI): void {
 		}
 	});
 
-	// Primary recovery path — always emitted, even when session_stop is skipped.
 	pi.on("agent_end", async (event, ctx) => {
 		const message = lastAssistant(event.messages);
+		// Refresh/keep reviewing UI after the primary stops (common wait state).
+		if (
+			!isTransientStreamFailure(message) &&
+			message &&
+			typeof message === "object" &&
+			(message as { stopReason?: string }).stopReason !== "error" &&
+			(await readAdvisorEnabled(ctx))
+		) {
+			if (!advisorPending) startAdvisorPending(ctx);
+		}
 		await scheduleContinue(message, ctx, "agent_end");
 	});
 
-	// Fallback for text-only error settles that do reach session_stop.
 	pi.on("session_stop", async (event, ctx: ExtensionContext) => {
 		return scheduleContinue(event.last_assistant_message, ctx, "session_stop");
 	});

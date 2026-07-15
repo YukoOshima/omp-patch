@@ -1,54 +1,31 @@
 # omp-patch
 
-oh-my-pi extension that auto-continues the main session after transient provider/stream failures:
+oh-my-pi extension that improves transient failure recovery and advisor visibility.
+
+## Stream retry
+
+Auto-continues the main session after:
 
 - Cursor Connect `resource_exhausted` (stock classifier often fail-fasts via `retry.maxDelayMs`)
 - HTTP/2 stream resets: `Stream closed with error code NGHTTP2_INTERNAL_ERROR` (stock auto-retry skips when the failed turn already has `toolCall` blocks)
-- Stream idle stall: `...stream stalled while waiting for the next event`
-- First-event timeout: `...timed out while waiting for the first event`
+- Stream idle stall / first-event timeout
 - Thinking-loop errors that include `stream stall`
 
-**Backoff:** ~5s on the first continue, then ~45–75s. **Cap:** 3 consecutive continues.
+**Backoff:** ~5s first continue, then ~45–75s. **Cap:** 3 consecutive continues.
 
-This does **not** patch `parseRateLimitReason` inside omp. Recovery hooks:
+## Advisor UI
 
-1. **`agent_end` (primary)** — omp skips `session_stop` when the failed assistant message still contains `toolCall` blocks (common for Cursor `resource_exhausted`). This path uses `sendMessage({ triggerTurn: true })`.
-2. **`session_stop` (fallback)** — text-only error settles that do emit stop hooks.
+While advisors review a finished turn (stock omp only shows a static `++` until cards appear):
+
+- Footer status: `Advisor reviewing… Ns`
+- Above-editor widget explaining review is in progress
+- Clears when notes arrive, after silent timeout (~120s), or when the main agent starts again
 
 ## Install
 
-**Plugin link (local clone):**
-
 ```bash
-git clone https://github.com/YukoOshima/omp-patch.git ~/Code/omp-patch
-omp plugin link ~/Code/omp-patch
+cd ~/.omp/plugins
+bun add github:YukoOshima/omp-patch
 ```
 
-**Plugin install from GitHub:**
-
-```bash
-omp plugin install github:YukoOshima/omp-patch
-```
-
-**Or drop / symlink into user extensions:**
-
-```bash
-ln -sfn ~/Code/omp-patch ~/.omp/agent/extensions/omp-patch
-```
-
-Restart `omp` after installing.
-
-## Stall timeouts
-
-Stall / first-event recovery only fires if the watchdog is enabled:
-
-```bash
-omp config set providers.streamIdleTimeoutSeconds 120
-omp config set providers.streamFirstEventTimeoutSeconds 120
-```
-
-`0` disables those watchdogs.
-
-## License
-
-MIT
+Then start a **new session** (or `--resume`) so the extension module loads. `/reload-plugins` alone is not enough for extension code changes.
