@@ -24,6 +24,8 @@ const MAX_CONTINUATIONS = 3;
 const FIRST_DELAY_MS = 5_000;
 const CAPACITY_BASE_MS = 45_000;
 const CAPACITY_JITTER_MS = 30_000;
+/** Hard cap for capacity / provider-requested waits — never sleep 30m windows. */
+const MAX_CAPACITY_WAIT_MS = 5 * 60 * 1000;
 
 /** How long to keep "Advisor reviewing…" if no notes arrive (silent finish). */
 const ADVISOR_SILENCE_MS = 120_000;
@@ -33,9 +35,21 @@ const ADVISOR_WIDGET_KEY = "omp-patch-advisor";
 const TRANSIENT_FAILURE_RE =
 	/resource[\s_]?exhausted|exceeds retry\.maxDelayMs|stream stalled|timed out while waiting for the first event|stream stall|NGHTTP2(?:_INTERNAL_ERROR)?|Stream closed with error code|HTTP2(?:StreamReset|INTERNAL_ERROR)/i;
 
-function capacityDelayMs(attempt: number): number {
+function parseProviderWaitMs(err: string): number | undefined {
+	const m = /Provider requested (\d+)ms wait/i.exec(err);
+	if (!m) return undefined;
+	const n = Number(m[1]);
+	return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+function capacityDelayMs(attempt: number, err: string): number {
+	const requested = parseProviderWaitMs(err);
+	if (requested != null) {
+		// e.g. provider asks 1800000ms (30m) → wait at most 5 minutes.
+		return Math.min(requested, MAX_CAPACITY_WAIT_MS);
+	}
 	if (attempt <= 1) return FIRST_DELAY_MS;
-	return CAPACITY_BASE_MS + Math.random() * CAPACITY_JITTER_MS;
+	return Math.min(CAPACITY_BASE_MS + Math.random() * CAPACITY_JITTER_MS, MAX_CAPACITY_WAIT_MS);
 }
 
 function errorText(message: unknown): string {
@@ -257,10 +271,19 @@ export default async function ompPatch(pi: ExtensionAPI): Promise<void> {
 		}, ADVISOR_SILENCE_MS);
 	};
 
+	const capacityDedupeKey = (err: string): string | undefined => {
+		if (/resource[\s_]?exhausted|exceeds retry\.maxDelayMs/i.test(err)) {
+			// Collapse stock fail-fast wrapper + original Connect error so
+			// auto_retry_end and agent_end do not double-continue.
+			return "capacity:resource_exhausted";
+		}
+		return undefined;
+	};
+
 	const scheduleContinue = async (
 		message: unknown,
 		ctx: ExtensionContext,
-		via: "agent_end" | "session_stop",
+		via: "agent_end" | "session_stop" | "auto_retry_end",
 	): Promise<{ continue: true; additionalContext: string } | undefined> => {
 		if (inFlight) return;
 		if (!isTransientStreamFailure(message)) {
@@ -271,7 +294,7 @@ export default async function ompPatch(pi: ExtensionAPI): Promise<void> {
 
 		const err = errorText(message) || "transient stream error";
 		const stamp = String((message as { timestamp?: number }).timestamp ?? "");
-		const dedupeKey = `${err}:${stamp}`;
+		const dedupeKey = capacityDedupeKey(err) ?? `${err}:${stamp}`;
 		if (handledErrorKey === dedupeKey) return;
 
 		if (consecutive >= MAX_CONTINUATIONS) {
@@ -284,11 +307,15 @@ export default async function ompPatch(pi: ExtensionAPI): Promise<void> {
 
 		consecutive += 1;
 		handledErrorKey = dedupeKey;
-		const delayMs = Math.round(capacityDelayMs(consecutive));
+		const delayMs = Math.round(capacityDelayMs(consecutive, err));
 
 		if (ctx.hasUI) {
+			const waitLabel =
+				delayMs >= 60_000
+					? `${Math.round(delayMs / 60_000)}m`
+					: `${Math.round(delayMs / 1000)}s`;
 			ctx.ui.notify(
-				`omp-patch (${via}): ${err.slice(0, 70)} — retrying in ${Math.round(delayMs / 1000)}s (${consecutive}/${MAX_CONTINUATIONS})`,
+				`omp-patch (${via}): ${err.slice(0, 70)} — retrying in ${waitLabel} (${consecutive}/${MAX_CONTINUATIONS})`,
 				"warning",
 			);
 		}
@@ -354,12 +381,19 @@ export default async function ompPatch(pi: ExtensionAPI): Promise<void> {
 		}
 		const err = event.finalError ?? "";
 		if (!TRANSIENT_FAILURE_RE.test(err)) return;
-		if (ctx.hasUI) {
-			ctx.ui.notify(
-				`omp-patch: fail-fast (${event.attempt}); waiting for agent_end/session_stop to continue`,
-				"warning",
-			);
-		}
+		// Stock refused a long provider wait (e.g. 30m > retry.maxDelayMs).
+		// Continue from here with wait capped at MAX_CAPACITY_WAIT_MS (5m) —
+		// never sleep the full provider-requested delay.
+		await scheduleContinue(
+			{
+				role: "assistant",
+				stopReason: "error",
+				errorMessage: err,
+				timestamp: Date.now(),
+			},
+			ctx,
+			"auto_retry_end",
+		);
 	});
 
 	pi.on("agent_end", async (event, ctx) => {

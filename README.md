@@ -7,11 +7,14 @@ oh-my-pi extension that improves transient failure recovery and advisor visibili
 Auto-continues the main session after:
 
 - Cursor Connect `resource_exhausted` (stock classifier often fail-fasts via `retry.maxDelayMs`)
+- Stock fail-fast when the provider asks to wait longer than `retry.maxDelayMs` (e.g. 30m > 5m) — continue starts on `auto_retry_end`, waiting **at most 5 minutes** (never the full provider window)
 - HTTP/2 stream resets: `Stream closed with error code NGHTTP2_INTERNAL_ERROR` (stock auto-retry skips when the failed turn already has `toolCall` blocks)
 - Stream idle stall / first-event timeout
 - Thinking-loop errors that include `stream stall`
 
-**Backoff:** ~5s first continue, then ~45–75s. **Cap:** 3 consecutive continues.
+**Backoff:** ~5s first continue for ordinary blips, then ~45–75s. When the provider requests a longer wait (e.g. 30m), sleep `min(requested, 5m)`. **Cap:** 3 consecutive continues; **never** wait more than 5 minutes per continue.
+
+Keep stock `retry.maxDelayMs` at the default (~5m) so omp fail-fasts instead of sleeping multi-hour rate-limit windows; omp-patch then continues with the 5m cap above.
 
 ## Advisor UI
 
