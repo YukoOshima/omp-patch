@@ -143,12 +143,10 @@ export default async function ompPatch(pi: ExtensionAPI): Promise<void> {
 		if (!ctx.hasUI) return;
 		const n = compactFinal.patched.length;
 		if (n > 0 && isCompactToolsEnabled()) {
-			if (!compactFinal.taskInstancePatched) {
-				throw new Error("omp-patch: compact tools loaded without TaskTool patch (should be unreachable)");
-			}
+			const taskTag = compactFinal.taskInstancePatched ? " +task" : "";
 			ctx.ui.setStatus(
 				"omp-patch-compact",
-				ctx.ui.theme.fg("dim", `compact tools · ${n} +task`),
+				ctx.ui.theme.fg("dim", `compact tools · ${n}${taskTag}`),
 			);
 			setTimeout(() => {
 				if (ctx.hasUI) ctx.ui.setStatus("omp-patch-compact", undefined);

@@ -360,21 +360,28 @@ export type CompactInstallMode =
 	| "exports+task"
 	| "exports+toolRenderers+task";
 
+function isTaskToolCtor(value: unknown): value is TaskToolCtor {
+	const T = value as TaskToolCtor | undefined;
+	return !!T && typeof T.create === "function" && typeof T.prototype?.renderCall === "function";
+}
+
 /**
- * Resolve the live host TaskTool class from the same module instance the runtime
- * uses. **Fast-fail, no fallback:**
- * - Only the canonical string-literal import `@oh-my-pi/pi-coding-agent/task`
- *   (omp rewrites literal `@(scope)/pi-*` onto the host instance; `import(variable)`
- *   is NOT rewritten and fails from the plugin directory)
- * - Validate `TaskTool` shape (`create` + `prototype.renderCall`)
- * - If `api.pi.TaskTool` is already present, it MUST be the same class identity
- * - Anything else throws — caller must abort plugin load (no silent `!task`)
+ * Resolve the live host TaskTool class.
+ *
+ * Prefer `api.pi.TaskTool` (the class the running TUI actually uses). Fall back
+ * to the canonical string-literal import `@oh-my-pi/pi-coding-agent/task` when
+ * the host has not exposed it yet (omp rewrites literal `@(scope)/pi-*` onto
+ * the host instance; `import(variable)` is NOT rewritten).
+ *
+ * Do **not** require import and `api.pi.TaskTool` to be the same class identity:
+ * plugins may resolve a different `@oh-my-pi/pi-coding-agent` copy than the
+ * running omp binary (e.g. 16.5.2 vs 17.0.0). Host wins on mismatch.
  */
 export async function resolveHostTaskTool(api: ExtensionAPI): Promise<TaskToolCtor> {
-	const isTaskToolCtor = (value: unknown): value is TaskToolCtor => {
-		const T = value as TaskToolCtor | undefined;
-		return !!T && typeof T.create === "function" && typeof T.prototype?.renderCall === "function";
-	};
+	const fromPi = (api.pi as { TaskTool?: TaskToolCtor } | undefined)?.TaskTool;
+	if (isTaskToolCtor(fromPi)) {
+		return fromPi;
+	}
 
 	// IMPORTANT: keep this as a string literal (not `import(spec)`).
 	// omp's legacy-pi source rewriter only rewrites literal specifiers.
@@ -392,13 +399,6 @@ export async function resolveHostTaskTool(api: ExtensionAPI): Promise<TaskToolCt
 	if (!isTaskToolCtor(TaskTool)) {
 		throw new Error(
 			"omp-patch: @oh-my-pi/pi-coding-agent/task did not export a usable TaskTool (need create + prototype.renderCall)",
-		);
-	}
-
-	const fromPi = (api.pi as { TaskTool?: TaskToolCtor } | undefined)?.TaskTool;
-	if (fromPi !== undefined && fromPi !== TaskTool) {
-		throw new Error(
-			"omp-patch: host identity mismatch — api.pi.TaskTool is not the same class as @oh-my-pi/pi-coding-agent/task",
 		);
 	}
 
@@ -432,12 +432,15 @@ export function installCompactToolUi(api: ExtensionAPI): CompactInstallResult & 
 	let taskInstancePatched = false;
 
 	const ready = (async (): Promise<CompactInstallResult> => {
-		const TaskTool = await resolveHostTaskTool(api);
-		taskInstancePatched = patchTaskToolClass(TaskTool, Text);
-		if (!taskInstancePatched) {
-			throw new Error("omp-patch: failed to patch live TaskTool instance path");
+		// Task patch is best-effort: never abort the rest of omp-patch (stream
+		// retry / advisor) when plugins resolve a different pi-coding-agent copy.
+		try {
+			const TaskTool = await resolveHostTaskTool(api);
+			taskInstancePatched = patchTaskToolClass(TaskTool, Text);
+			if (taskInstancePatched && !patched.includes("task")) patched.push("task");
+		} catch {
+			taskInstancePatched = false;
 		}
-		if (!patched.includes("task")) patched.push("task");
 
 		const map = await tryLoadHostToolRenderers(hostBash);
 		if (map) {

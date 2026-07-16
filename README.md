@@ -32,9 +32,9 @@ Claude Code–style tool display:
 
 Toggle at runtime: `/compact-tools`
 
-`task` is patched on the live `TaskTool` class (via host `@oh-my-pi/pi-coding-agent/task`), not only `toolRenderers.task` — because the TUI prefers instance renderers for task.
+`task` is patched on the live `TaskTool` class (prefer `api.pi.TaskTool`, else literal import `@oh-my-pi/pi-coding-agent/task`), not only `toolRenderers.task` — because the TUI prefers instance renderers for task.
 
-`task` resolution is **fast-fail**: only the canonical literal import `@oh-my-pi/pi-coding-agent/task` is used. Import/shape/host-identity failures throw and abort plugin load (no silent `!task` fallback).
+`task` patching is **best-effort**: if the host class cannot be resolved or patched (e.g. plugins resolve a different `@oh-my-pi/pi-coding-agent` copy than the running omp), compact `task` UI is skipped and the rest of omp-patch (stream retry, advisor) still loads.
 
 
 
