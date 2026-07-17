@@ -1,8 +1,8 @@
 /**
  * omp-patch
  *
- * 1) Transient stream retry — auto-continue after failures stock omp often
- *    refuses (resource_exhausted fail-fast, NGHTTP2 mid-toolCall, stream stall).
+ * 1) Transient stream retry — moved to stream-retry.ts; scheduled via setTimeout
+ *    so handlers never sleep (host 30s handler timeout).
  * 2) Advisor presence UI — while advisors review a finished turn, show footer
  *    status + an above-editor widget (stock omp only shows a static "++" and
  *    Advisor cards after notes arrive).
@@ -10,6 +10,7 @@
  * 4) Advisor autoresume — when omp preserves a concern/blocker card after a
  *    terminal text answer, auto-continue so the agent weighs and acts on it.
  */
+import { statSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { sep } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
@@ -19,73 +20,14 @@ import {
 	isCompactToolsEnabled,
 	toggleCompactTools,
 } from "./compact-tools.ts";
-
-const MAX_CONTINUATIONS = 3;
-const FIRST_DELAY_MS = 5_000;
-const CAPACITY_BASE_MS = 45_000;
-const CAPACITY_JITTER_MS = 30_000;
-/** Hard cap for capacity / provider-requested waits — never sleep 30m windows. */
-const MAX_CAPACITY_WAIT_MS = 5 * 60 * 1000;
+import { installStreamRetry, isTransientStreamFailure, lastAssistant } from "./stream-retry.ts";
 
 /** How long to keep "Advisor reviewing…" if no notes arrive (silent finish). */
 const ADVISOR_SILENCE_MS = 120_000;
 const ADVISOR_STATUS_KEY = "omp-patch-advisor";
 const ADVISOR_WIDGET_KEY = "omp-patch-advisor";
 
-const TRANSIENT_FAILURE_RE =
-	/resource[\s_]?exhausted|exceeds retry\.maxDelayMs|stream stalled|timed out while waiting for the first event|stream stall|NGHTTP2(?:_INTERNAL_ERROR)?|Stream closed with error code|HTTP2(?:StreamReset|INTERNAL_ERROR)/i;
-
-function parseProviderWaitMs(err: string): number | undefined {
-	const m = /Provider requested (\d+)ms wait/i.exec(err);
-	if (!m) return undefined;
-	const n = Number(m[1]);
-	return Number.isFinite(n) && n > 0 ? n : undefined;
-}
-
-function capacityDelayMs(attempt: number, err: string): number {
-	const requested = parseProviderWaitMs(err);
-	if (requested != null) {
-		// e.g. provider asks 1800000ms (30m) → wait at most 5 minutes.
-		return Math.min(requested, MAX_CAPACITY_WAIT_MS);
-	}
-	if (attempt <= 1) return FIRST_DELAY_MS;
-	return Math.min(CAPACITY_BASE_MS + Math.random() * CAPACITY_JITTER_MS, MAX_CAPACITY_WAIT_MS);
-}
-
-function errorText(message: unknown): string {
-	if (!message || typeof message !== "object") return "";
-	const m = message as { errorMessage?: string };
-	return m.errorMessage ?? "";
-}
-
-function isTransientStreamFailure(message: unknown): boolean {
-	if (!message || typeof message !== "object") return false;
-	const m = message as { role?: string; stopReason?: string; errorMessage?: string };
-	if (m.role !== "assistant" || m.stopReason !== "error") return false;
-	return TRANSIENT_FAILURE_RE.test(m.errorMessage ?? "");
-}
-
-function lastAssistant(messages: unknown[] | undefined): unknown {
-	if (!Array.isArray(messages)) return undefined;
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const m = messages[i] as { role?: string } | undefined;
-		if (m?.role === "assistant") return m;
-	}
-	return undefined;
-}
-
-function continueHint(err: string): string {
-	if (/resource[\s_]?exhausted|exceeds retry\.maxDelayMs/i.test(err)) {
-		return "The previous turn failed on a transient Cursor/Connect resource_exhausted (model capacity) error. Continue the interrupted work from where you left off; do not ask the user to restate the request.";
-	}
-	if (/stalled|first event|stream stall/i.test(err)) {
-		return "The previous turn failed because the provider stream stalled or timed out waiting for events. Continue the interrupted work from where you left off; do not ask the user to restate the request.";
-	}
-	if (/NGHTTP2|Stream closed with error code|HTTP2(?:StreamReset|INTERNAL_ERROR)/i.test(err)) {
-		return "The previous turn failed on a transient HTTP/2 stream reset (e.g. NGHTTP2_INTERNAL_ERROR). Continue the interrupted work from where you left off; do not ask the user to restate the request.";
-	}
-	return "The previous turn failed on a transient provider/stream error. Continue the interrupted work from where you left off; do not ask the user to restate the request.";
-}
+type TimerHandle = ReturnType<typeof setTimeout>;
 
 function isAdvisorCustomMessage(message: unknown): boolean {
 	if (!message || typeof message !== "object") return false;
@@ -114,24 +56,50 @@ function resolveAgentDir(ctx: ExtensionContext): string {
 	return `${homedir()}/.omp/agent`;
 }
 
-/** Best-effort: top-level `advisor.enabled` in config.yml (assume on if unreadable). */
-async function readAdvisorEnabled(ctx: ExtensionContext): Promise<boolean> {
+/** mtime cache for readAdvisorEnabled; unset / stale → re-read. */
+let advisorEnabledCache: { mtimeMs: number; value: boolean } | undefined;
+
+/**
+ * Best-effort: top-level block `advisor:` → same-indent `enabled:` in config.yml.
+ * Inline form `advisor: { enabled: false }` is not supported → default true.
+ * Assume on if unreadable.
+ */
+function readAdvisorEnabled(ctx: ExtensionContext): boolean {
+	const path = `${resolveAgentDir(ctx)}/config.yml`;
 	try {
-		const text = await Bun.file(`${resolveAgentDir(ctx)}/config.yml`).text();
+		const { mtimeMs } = statSync(path);
+		if (advisorEnabledCache && advisorEnabledCache.mtimeMs === mtimeMs) {
+			return advisorEnabledCache.value;
+		}
+		const text = readFileSync(path, "utf8");
 		const lines = text.split(/\r?\n/);
 		let inAdvisor = false;
+		let childIndent: string | undefined;
+		let value = true;
 		for (const line of lines) {
-			if (/^advisor:\s*(?:#.*)?$/.test(line)) {
-				inAdvisor = true;
+			if (!inAdvisor) {
+				// Block form only; inline `advisor: { … }` intentionally ignored → default true.
+				if (/^advisor:\s*(?:#.*)?$/.test(line)) {
+					inAdvisor = true;
+					childIndent = undefined;
+				}
 				continue;
 			}
-			if (inAdvisor) {
-				if (/^\S/.test(line)) break;
-				const m = /^[ \t]+enabled:\s*(true|false)\b/.exec(line);
-				if (m) return m[1] === "true";
+			if (line.trim() === "") continue;
+			const leading = /^([ \t]*)/.exec(line)?.[1] ?? "";
+			if (leading.length === 0) break;
+			// Comment lines must not anchor the child indent.
+			if (line.slice(leading.length).startsWith("#")) continue;
+			if (childIndent === undefined) childIndent = leading;
+			if (leading !== childIndent) continue;
+			const m = /^enabled:\s*(true|false)\b/.exec(line.slice(childIndent.length));
+			if (m) {
+				value = m[1] === "true";
+				break;
 			}
 		}
-		return true;
+		advisorEnabledCache = { mtimeMs, value };
+		return value;
 	} catch {
 		return true;
 	}
@@ -172,14 +140,12 @@ export default async function ompPatch(pi: ExtensionAPI): Promise<void> {
 	installAdvisorAutoresume(pi);
 
 	// ——— transient stream retry ———
-	let consecutive = 0;
-	let inFlight = false;
-	let handledErrorKey: string | undefined;
+	installStreamRetry(pi);
 
 	// ——— advisor UI ———
 	let advisorPending = false;
 	let advisorStartedAt = 0;
-	let advisorSilenceTimer: ReturnType<typeof setTimeout> | undefined;
+	let advisorSilenceTimer: TimerHandle | undefined;
 	let advisorTickTimer: ReturnType<typeof setInterval> | undefined;
 	let lastUiCtx: ExtensionContext | undefined;
 
@@ -271,86 +237,11 @@ export default async function ompPatch(pi: ExtensionAPI): Promise<void> {
 		}, ADVISOR_SILENCE_MS);
 	};
 
-	const capacityDedupeKey = (err: string): string | undefined => {
-		if (/resource[\s_]?exhausted|exceeds retry\.maxDelayMs/i.test(err)) {
-			// Collapse stock fail-fast wrapper + original Connect error so
-			// auto_retry_end and agent_end do not double-continue.
-			return "capacity:resource_exhausted";
-		}
-		return undefined;
-	};
-
-	const scheduleContinue = async (
-		message: unknown,
-		ctx: ExtensionContext,
-		via: "agent_end" | "session_stop" | "auto_retry_end",
-	): Promise<{ continue: true; additionalContext: string } | undefined> => {
-		if (inFlight) return;
-		if (!isTransientStreamFailure(message)) {
-			consecutive = 0;
-			handledErrorKey = undefined;
-			return;
-		}
-
-		const err = errorText(message) || "transient stream error";
-		const stamp = String((message as { timestamp?: number }).timestamp ?? "");
-		const dedupeKey = capacityDedupeKey(err) ?? `${err}:${stamp}`;
-		if (handledErrorKey === dedupeKey) return;
-
-		if (consecutive >= MAX_CONTINUATIONS) {
-			if (ctx.hasUI) {
-				ctx.ui.notify(`omp-patch: gave up after ${MAX_CONTINUATIONS} continues`, "error");
-			}
-			consecutive = 0;
-			return;
-		}
-
-		consecutive += 1;
-		handledErrorKey = dedupeKey;
-		const delayMs = Math.round(capacityDelayMs(consecutive, err));
-
-		if (ctx.hasUI) {
-			const waitLabel =
-				delayMs >= 60_000
-					? `${Math.round(delayMs / 60_000)}m`
-					: `${Math.round(delayMs / 1000)}s`;
-			ctx.ui.notify(
-				`omp-patch (${via}): ${err.slice(0, 70)} — retrying in ${waitLabel} (${consecutive}/${MAX_CONTINUATIONS})`,
-				"warning",
-			);
-		}
-
-		inFlight = true;
-		try {
-			await Bun.sleep(delayMs);
-			const additionalContext = continueHint(err);
-
-			if (via === "session_stop") {
-				return { continue: true, additionalContext };
-			}
-
-			pi.sendMessage(
-				{
-					customType: "omp-patch-retry",
-					content: additionalContext,
-					display: true,
-				},
-				{ triggerTurn: true, deliverAs: "nextTurn" },
-			);
-		} finally {
-			inFlight = false;
-		}
-	};
-
 	pi.on("turn_end", async (event, ctx) => {
 		const last = event.message;
-		if (last?.role === "assistant" && last.stopReason !== "error") {
-			consecutive = 0;
-			handledErrorKey = undefined;
-		}
 		// Advisors kick off on each primary turn_end; stock UI only shows "++".
 		if (last?.role === "assistant" && (last.stopReason === "stop" || last.stopReason === "length")) {
-			if (await readAdvisorEnabled(ctx)) {
+			if (readAdvisorEnabled(ctx)) {
 				startAdvisorPending(ctx);
 			}
 		}
@@ -373,45 +264,15 @@ export default async function ompPatch(pi: ExtensionAPI): Promise<void> {
 		stopAdvisorPending(ctx, "clear");
 	});
 
-	pi.on("auto_retry_end", async (event, ctx) => {
-		if (event.success) {
-			consecutive = 0;
-			handledErrorKey = undefined;
-			return;
-		}
-		const err = event.finalError ?? "";
-		if (!TRANSIENT_FAILURE_RE.test(err)) return;
-		// Stock refused a long provider wait (e.g. 30m > retry.maxDelayMs).
-		// Continue from here with wait capped at MAX_CAPACITY_WAIT_MS (5m) —
-		// never sleep the full provider-requested delay.
-		await scheduleContinue(
-			{
-				role: "assistant",
-				stopReason: "error",
-				errorMessage: err,
-				timestamp: Date.now(),
-			},
-			ctx,
-			"auto_retry_end",
-		);
-	});
-
 	pi.on("agent_end", async (event, ctx) => {
 		const message = lastAssistant(event.messages);
+		const stopReason =
+			message && typeof message === "object" && "stopReason" in message
+				? message.stopReason
+				: undefined;
 		// Refresh/keep reviewing UI after the primary stops (common wait state).
-		if (
-			!isTransientStreamFailure(message) &&
-			message &&
-			typeof message === "object" &&
-			(message as { stopReason?: string }).stopReason !== "error" &&
-			(await readAdvisorEnabled(ctx))
-		) {
+		if (!isTransientStreamFailure(message) && message && stopReason !== "error" && readAdvisorEnabled(ctx)) {
 			if (!advisorPending) startAdvisorPending(ctx);
 		}
-		await scheduleContinue(message, ctx, "agent_end");
-	});
-
-	pi.on("session_stop", async (event, ctx: ExtensionContext) => {
-		return scheduleContinue(event.last_assistant_message, ctx, "session_stop");
 	});
 }

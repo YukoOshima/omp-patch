@@ -6,6 +6,8 @@
  *
  * Patches host tool renderers in place so builtins keep their real `execute`.
  * Prefers `api.pi.*ToolRenderer` (same module instance as the running TUI).
+ * mergeCallAndResult follows compactEnabled via a getter, so toggling compact
+ * off fully restores stock rendering.
  */
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
@@ -124,15 +126,13 @@ export function summarizeToolArgs(toolName: string, args: unknown): string {
 		case "vibe_spawn":
 			return truncate(String(a.prompt ?? a.task ?? a.message ?? ""), 72);
 		case "vibe_send":
-		case "irc":
 			return truncate(String(a.message ?? a.text ?? ""), 72);
-		case "todo":
-			return truncate(String(a.merge !== undefined ? "update" : (a.content ?? "")), 40);
-		case "job":
-			return truncate(
-				String(a.i ?? (Array.isArray(a.poll) ? "poll" : a.list ? "list" : "")),
-				40,
+		case "todo": {
+			const bits = [a.op, a.task ?? a.phase].filter(
+				(v): v is string => typeof v === "string" && v.trim().length > 0,
 			);
+			return truncate(bits.join(" · "), 40);
+		}
 		default: {
 			const hit = firstString(a, [
 				"command",
@@ -199,8 +199,13 @@ function patchRenderer(
 		return compactLine(Text, toolName, args, options, theme, result);
 	};
 
-	// Prefer a single merged row: call while pending, result when done.
-	renderer.mergeCallAndResult = true;
+	// Prefer a single merged row while compact is on; restore stock when toggled off.
+	const originalMerge = renderer.mergeCallAndResult === true;
+	Object.defineProperty(renderer, "mergeCallAndResult", {
+		configurable: true,
+		enumerable: true,
+		get: () => (compactEnabled ? true : originalMerge),
+	});
 	renderer[PATCHED] = true;
 }
 
@@ -240,12 +245,6 @@ function patchExportRenderers(
 		["debug", api.pi.debugToolRenderer],
 		["eval", api.pi.evalToolRenderer],
 		["inspect_image", api.pi.inspectImageToolRenderer],
-		["irc", api.pi.ircToolRenderer],
-		["job", api.pi.jobToolRenderer],
-		["launch", api.pi.launchToolRenderer],
-		["resolve", api.pi.resolveToolRenderer],
-		["search_tool_bm25", api.pi.searchToolBm25Renderer],
-		["ssh", api.pi.sshToolRenderer],
 		["todo", api.pi.todoToolRenderer],
 		["goal", api.pi.goalToolRenderer],
 	];
@@ -305,7 +304,12 @@ export function patchTaskToolInstance(tool: TaskToolLike, Text: TextCtor): boole
 		if (options.expanded) return boundResult(result, options, theme, args);
 		return compactLine(Text, "task", args, options, theme, result);
 	};
-	tool.mergeCallAndResult = true;
+	const originalMerge = tool.mergeCallAndResult === true;
+	Object.defineProperty(tool, "mergeCallAndResult", {
+		configurable: true,
+		enumerable: true,
+		get: () => (compactEnabled ? true : originalMerge),
+	});
 	Object.defineProperty(tool, PATCHED, { value: true, configurable: true });
 	return true;
 }

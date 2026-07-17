@@ -6,6 +6,8 @@
  * Intentionally does NOT wake:
  * - nit / omitted severity (aside; never preserved as an idle card)
  * - Esc / cancel suppression (no recent terminal text answer)
+ * - window cleared on non-"stop" agent_end endings (aligns with stock Esc
+ *   suppression); empty "stop" endings keep it (host discards those messages)
  * - plan mode (mode_change === "plan")
  * - live steered turns (agent not idle)
  */
@@ -214,6 +216,17 @@ export function installAdvisorAutoresume(pi: ExtensionAPI): void {
 		const last = lastAssistant(event.messages);
 		if (isTerminalTextAssistantAnswer(last)) {
 			lastTerminalAnswerAt = Date.now();
+			return;
+		}
+		// Clear only on definitive non-terminal endings (abort/error/toolUse/
+		// length), aligning with stock autoResumeSuppressed (Esc). Empty "stop"
+		// messages leave the window untouched: the host discards accepted
+		// terminal empty stops (e.g. autolearn continuations) from active state
+		// and preserves later cards against the restored terminal tail.
+		const stopReason =
+			last && typeof last === "object" && "stopReason" in last ? last.stopReason : undefined;
+		if (stopReason !== "stop") {
+			lastTerminalAnswerAt = 0;
 		}
 	});
 

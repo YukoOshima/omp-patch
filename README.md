@@ -12,7 +12,13 @@ Auto-continues the main session after:
 - Stream idle stall / first-event timeout
 - Thinking-loop errors that include `stream stall`
 
-**Backoff:** ~5s first continue for ordinary blips, then ~45–75s. When the provider requests a longer wait (e.g. 30m), sleep `min(requested, 5m)`. **Cap:** 3 consecutive continues; **never** wait more than 5 minutes per continue.
+**How:** Retries are scheduled with `setTimeout` so the extension handler returns immediately — omp hard-times out handlers at 30s and discards their return value, which would silently drop long backoffs under a sleep-in-handler design. Continue is always triggered from `agent_end` / `auto_retry_end` via `pi.sendMessage(..., { triggerTurn: true, deliverAs: "nextTurn" })`.
+
+**Dedupe:** One terminal failure fans out to multiple events; continues are keyed by error class and the key resets on `agent_start`, so the same failure fanout continues once while an identical failure on a later turn retries normally. **Cap:** 5 consecutive continues (truly effective under this dedupe).
+
+**Session:** `session_start` / `session_switch` cancel any pending retry and reset the consecutive count.
+
+**Backoff:** ~5s first continue for ordinary blips, then ~45–75s. When the provider requests a longer wait (e.g. 30m), sleep `min(requested, 5m)`. **Never** wait more than 5 minutes per continue.
 
 Keep stock `retry.maxDelayMs` at the default (~5m) so omp fail-fasts instead of sleeping multi-hour rate-limit windows; omp-patch then continues with the 5m cap above.
 
