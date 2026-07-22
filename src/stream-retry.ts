@@ -2,15 +2,18 @@
  * Transient stream retry — auto-continue after failures stock omp often
  * refuses (resource_exhausted fail-fast, NGHTTP2 mid-toolCall, stream stall).
  *
- * Host constraints (omp 17.0.1, verified against shipped source):
+ * Host constraints (omp 17.0.2+, verified against shipped source):
  * - Every extension handler is bounded by a 30s timeout; on timeout the return
  *   value is discarded while the handler keeps running in the background. So
- *   handlers NEVER sleep: retries are scheduled via setTimeout and fired with
+ *   handlers NEVER sleep: retries are scheduled via ctx.setTimeout and fired with
  *   pi.sendMessage(triggerTurn, deliverAs:"nextTurn"), which is timeout-immune.
  * - One terminal failure fans out to auto_retry_end → session_stop → agent_end.
  *   We ignore session_stop (its continue return value cannot survive a delayed
  *   retry) and dedupe the rest by error-class key; agent_start re-arms the key
  *   so the NEXT turn's identical failure is retried again.
+ * - Timers go through the ctx managed API (setTimeout/clearTimer): a bare
+ *   setTimeout survives session reload and can fire into the new session, and
+ *   after runtime unload sendMessage throws 'Extension runtime not initialized'.
  */
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
@@ -89,17 +92,17 @@ function dedupeKeyFor(err: string): string {
 	return `transient:${err.slice(0, 200)}`;
 }
 
-/** Timer handle owned by this module (Bun/Node setTimeout return). */
-type RetryTimer = ReturnType<typeof setTimeout>;
+/** Timer handle from ctx.setTimeout (managed; auto-unref'd by the host). */
+type RetryTimer = ReturnType<ExtensionContext["setTimeout"]>;
 
 export function installStreamRetry(pi: ExtensionAPI): void {
 	let consecutive = 0;
 	let handledErrorKey: string | undefined;
 	let pendingTimer: RetryTimer | undefined;
 
-	const cancelPending = (): void => {
+	const cancelPending = (ctx: ExtensionContext): void => {
 		if (pendingTimer) {
-			clearTimeout(pendingTimer);
+			ctx.clearTimer(pendingTimer);
 			pendingTimer = undefined;
 		}
 	};
@@ -139,7 +142,7 @@ export function installStreamRetry(pi: ExtensionAPI): void {
 			);
 		}
 
-		pendingTimer = setTimeout(() => {
+		pendingTimer = ctx.setTimeout(() => {
 			pendingTimer = undefined;
 			try {
 				pi.sendMessage(
@@ -150,14 +153,16 @@ export function installStreamRetry(pi: ExtensionAPI): void {
 					},
 					{ triggerTurn: true, deliverAs: "nextTurn" },
 				);
-			} catch {
+			} catch (err) {
 				// Session may be gone by fire time — a throw here would be an
 				// uncaught timer exception and kill the host process.
+				try {
+					if (ctx.hasUI) ctx.ui.notify(`omp-patch: retry send failed: ${String(err)}`, "warning");
+				} catch {
+					// ctx.ui may be unavailable after teardown.
+				}
 			}
 		}, delayMs);
-		// Bun/Node timer handles expose unref(); the DOM-style typing does not.
-		const handle: { unref?: () => void } = pendingTimer as unknown as { unref?: () => void };
-		handle.unref?.();
 	};
 
 	/** Assistant-message entry (agent_end). Non-transient messages reset the budget. */
@@ -172,27 +177,27 @@ export function installStreamRetry(pi: ExtensionAPI): void {
 		scheduleContinue(errorText(message) || "transient stream error", ctx, via);
 	};
 
-	pi.on("agent_start", async () => {
+	pi.on("agent_start", async (_event, ctx) => {
 		// New turn = new failure instance: re-arm dedupe so an identical error
 		// in the upcoming turn is retried again. A starting turn also supersedes
 		// any pending retry (e.g. the user continued manually). `consecutive`
 		// intentionally survives — it caps consecutive FAILED continue turns.
-		cancelPending();
+		cancelPending(ctx);
 		handledErrorKey = undefined;
 	});
 
-	pi.on("turn_end", async (event) => {
+	pi.on("turn_end", async (event, ctx) => {
 		const last = event.message;
 		if (last?.role === "assistant" && last.stopReason !== "error") {
 			// A successful turn makes any pending retry stale.
-			cancelPending();
+			cancelPending(ctx);
 			reset();
 		}
 	});
 
 	pi.on("auto_retry_end", async (event, ctx) => {
 		if (event.success) {
-			cancelPending();
+			cancelPending(ctx);
 			reset();
 			return;
 		}
@@ -208,19 +213,24 @@ export function installStreamRetry(pi: ExtensionAPI): void {
 		handleAssistantMessage(lastAssistant(event.messages), ctx, "agent_end");
 	});
 
-	pi.on("input", async () => {
+	pi.on("input", async (_event, ctx) => {
 		// User took the wheel — a pending auto-retry must not inject a spurious
 		// continue into their turn (input fires before agent_start).
-		cancelPending();
+		cancelPending(ctx);
 	});
 
-	pi.on("session_start", async () => {
-		cancelPending();
+	pi.on("session_start", async (_event, ctx) => {
+		cancelPending(ctx);
 		reset();
 	});
 
-	pi.on("session_switch", async () => {
-		cancelPending();
+	pi.on("session_switch", async (_event, ctx) => {
+		cancelPending(ctx);
+		reset();
+	});
+
+	pi.on("session_shutdown", (_e, ctx) => {
+		cancelPending(ctx);
 		reset();
 	});
 }

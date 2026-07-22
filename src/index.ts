@@ -27,7 +27,7 @@ const ADVISOR_SILENCE_MS = 120_000;
 const ADVISOR_STATUS_KEY = "omp-patch-advisor";
 const ADVISOR_WIDGET_KEY = "omp-patch-advisor";
 
-type TimerHandle = ReturnType<typeof setTimeout>;
+type TimerHandle = ReturnType<ExtensionContext["setTimeout"]>;
 
 function isAdvisorCustomMessage(message: unknown): boolean {
 	if (!message || typeof message !== "object") return false;
@@ -114,7 +114,7 @@ export default async function ompPatch(pi: ExtensionAPI): Promise<void> {
 	const compactFinal = await compact.ready;
 	pi.registerCommand("compact-tools", {
 		description: "Toggle compact tool results (one-liner; Ctrl+O expands)",
-		handler: async (ctx) => {
+		handler: async (_args, ctx) => {
 			const on = toggleCompactTools();
 			if (ctx.hasUI) {
 				ctx.ui.notify(`omp-patch: compact tools ${on ? "on" : "off"} — Ctrl+O expands`, "info");
@@ -130,7 +130,7 @@ export default async function ompPatch(pi: ExtensionAPI): Promise<void> {
 				"omp-patch-compact",
 				ctx.ui.theme.fg("dim", `compact tools · ${n}${taskTag}`),
 			);
-			setTimeout(() => {
+			ctx.setTimeout(() => {
 				if (ctx.hasUI) ctx.ui.setStatus("omp-patch-compact", undefined);
 			}, 4_000);
 		}
@@ -146,16 +146,17 @@ export default async function ompPatch(pi: ExtensionAPI): Promise<void> {
 	let advisorPending = false;
 	let advisorStartedAt = 0;
 	let advisorSilenceTimer: TimerHandle | undefined;
-	let advisorTickTimer: ReturnType<typeof setInterval> | undefined;
+	let advisorTickTimer: TimerHandle | undefined;
 	let lastUiCtx: ExtensionContext | undefined;
 
-	const clearAdvisorTimers = (): void => {
+	const clearAdvisorTimers = (ctx?: ExtensionContext): void => {
+		const c = ctx ?? lastUiCtx;
 		if (advisorSilenceTimer) {
-			clearTimeout(advisorSilenceTimer);
+			if (c) c.clearTimer(advisorSilenceTimer);
 			advisorSilenceTimer = undefined;
 		}
 		if (advisorTickTimer) {
-			clearInterval(advisorTickTimer);
+			if (c) c.clearTimer(advisorTickTimer);
 			advisorTickTimer = undefined;
 		}
 	};
@@ -211,12 +212,12 @@ export default async function ompPatch(pi: ExtensionAPI): Promise<void> {
 			return;
 		}
 		advisorPending = false;
-		clearAdvisorTimers();
+		clearAdvisorTimers(ctx);
 		const ui = ctx ?? lastUiCtx;
 		if (!ui?.hasUI) return;
 		paintAdvisorUi(ui, mode, noteCount);
 		if (mode === "notes" || mode === "silent") {
-			setTimeout(() => {
+			ui.setTimeout(() => {
 				if (!advisorPending && ui.hasUI) paintAdvisorUi(ui, "clear");
 			}, 4_000);
 		}
@@ -226,13 +227,13 @@ export default async function ompPatch(pi: ExtensionAPI): Promise<void> {
 		lastUiCtx = ctx;
 		advisorPending = true;
 		advisorStartedAt = Date.now();
-		clearAdvisorTimers();
+		clearAdvisorTimers(ctx);
 		paintAdvisorUi(ctx, "reviewing");
-		advisorTickTimer = setInterval(() => {
+		advisorTickTimer = ctx.setInterval(() => {
 			if (!advisorPending || !lastUiCtx?.hasUI) return;
 			paintAdvisorUi(lastUiCtx, "reviewing");
 		}, 1_000);
-		advisorSilenceTimer = setTimeout(() => {
+		advisorSilenceTimer = ctx.setTimeout(() => {
 			stopAdvisorPending(lastUiCtx, "silent");
 		}, ADVISOR_SILENCE_MS);
 	};
@@ -274,5 +275,12 @@ export default async function ompPatch(pi: ExtensionAPI): Promise<void> {
 		if (!isTransientStreamFailure(message) && message && stopReason !== "error" && readAdvisorEnabled(ctx)) {
 			if (!advisorPending) startAdvisorPending(ctx);
 		}
+	});
+
+	pi.on("session_shutdown", async (_event, ctx) => {
+		clearAdvisorTimers(ctx);
+		advisorPending = false;
+		advisorStartedAt = 0;
+		lastUiCtx = undefined;
 	});
 }

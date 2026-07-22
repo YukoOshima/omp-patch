@@ -10,6 +10,10 @@
  *   suppression); empty "stop" endings keep it (host discards those messages)
  * - plan mode (mode_change === "plan")
  * - live steered turns (agent not idle)
+ *
+ * Timers use the ctx managed API (setTimeout/clearTimer): after runtime unload
+ * bare timers can still fire and pi.sendMessage throws; managed timers contain
+ * those exceptions and are cleared on session_shutdown.
  */
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
@@ -18,10 +22,13 @@ const DEBOUNCE_MS = 350;
 const TERMINAL_ANSWER_WINDOW_MS = 180_000;
 const STATUS_KEY = "omp-patch-advisor-autoresume";
 
+/** Timer handle from ctx.setTimeout (managed; cleared on session_shutdown). */
+type AutoresumeTimer = ReturnType<ExtensionContext["setTimeout"]>;
+
 let enabled = true;
 let consecutive = 0;
 let inFlight = false;
-let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+let debounceTimer: AutoresumeTimer | undefined;
 let lastTerminalAnswerAt = 0;
 let lastTriggeredCardKey: string | undefined;
 
@@ -161,13 +168,66 @@ function continuePrompt(notes: Array<{ note: string; severity: string; advisor?:
 }
 
 export function installAdvisorAutoresume(pi: ExtensionAPI): void {
+	async function fireAutoresume(
+		ctx: ExtensionContext,
+		notes: Array<{ note: string; severity: "concern" | "blocker"; advisor?: string }>,
+		key: string,
+	): Promise<void> {
+		if (!enabled || inFlight) return;
+		if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
+		if (isPlanModeActive(ctx)) return;
+		if (
+			lastTerminalAnswerAt <= 0 ||
+			Date.now() - lastTerminalAnswerAt > TERMINAL_ANSWER_WINDOW_MS
+		) {
+			return;
+		}
+		if (consecutive >= MAX_CONSECUTIVE) {
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					`omp-patch: advisor autoresume capped at ${MAX_CONSECUTIVE} consecutive continues`,
+					"warning",
+				);
+			}
+			return;
+		}
+
+		consecutive += 1;
+		lastTriggeredCardKey = key;
+		inFlight = true;
+		try {
+			if (ctx.hasUI) {
+				const theme = ctx.ui.theme;
+				ctx.ui.setStatus(
+					STATUS_KEY,
+					theme.fg("dim", `advisor autoresume · ${notes.map(n => n.severity).join("/")}`),
+				);
+				ctx.setTimeout(() => {
+					if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
+				}, 4_000);
+			}
+
+			pi.sendMessage(
+				{
+					customType: "omp-patch-advisor-autoresume",
+					content: continuePrompt(notes),
+					display: true,
+					attribution: "agent",
+				},
+				{ triggerTurn: true, deliverAs: "nextTurn" },
+			);
+		} finally {
+			inFlight = false;
+		}
+	}
+
 	pi.registerCommand("advisor-autoresume", {
 		description: "Toggle auto-continue for preserved advisor concern/blocker cards (default on)",
 		handler: async (_args, ctx) => {
 			const on = toggleAdvisorAutoresume();
 			if (!on) {
 				if (debounceTimer) {
-					clearTimeout(debounceTimer);
+					ctx.clearTimer(debounceTimer);
 					debounceTimer = undefined;
 				}
 			}
@@ -180,22 +240,22 @@ export function installAdvisorAutoresume(pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.on("session_start", async () => {
+	pi.on("session_start", async (_event, ctx) => {
 		consecutive = 0;
 		lastTerminalAnswerAt = 0;
 		lastTriggeredCardKey = undefined;
 		if (debounceTimer) {
-			clearTimeout(debounceTimer);
+			ctx.clearTimer(debounceTimer);
 			debounceTimer = undefined;
 		}
 	});
 
-	pi.on("session_switch", async () => {
+	pi.on("session_switch", async (_event, ctx) => {
 		consecutive = 0;
 		lastTerminalAnswerAt = 0;
 		lastTriggeredCardKey = undefined;
 		if (debounceTimer) {
-			clearTimeout(debounceTimer);
+			ctx.clearTimer(debounceTimer);
 			debounceTimer = undefined;
 		}
 	});
@@ -205,9 +265,9 @@ export function installAdvisorAutoresume(pi: ExtensionAPI): void {
 		consecutive = 0;
 	});
 
-	pi.on("agent_start", async () => {
+	pi.on("agent_start", async (_event, ctx) => {
 		if (debounceTimer) {
-			clearTimeout(debounceTimer);
+			ctx.clearTimer(debounceTimer);
 			debounceTimer = undefined;
 		}
 	});
@@ -253,57 +313,30 @@ export function installAdvisorAutoresume(pi: ExtensionAPI): void {
 		const key = cardKey(notes);
 		if (key && key === lastTriggeredCardKey) return;
 
-		if (debounceTimer) clearTimeout(debounceTimer);
-		debounceTimer = setTimeout(() => {
+		if (debounceTimer) ctx.clearTimer(debounceTimer);
+		debounceTimer = ctx.setTimeout(() => {
 			debounceTimer = undefined;
-			void (async () => {
-				if (!enabled || inFlight) return;
-				if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
-				if (isPlanModeActive(ctx)) return;
-				if (
-					lastTerminalAnswerAt <= 0 ||
-					Date.now() - lastTerminalAnswerAt > TERMINAL_ANSWER_WINDOW_MS
-				) {
-					return;
-				}
-				if (consecutive >= MAX_CONSECUTIVE) {
-					if (ctx.hasUI) {
-						ctx.ui.notify(
-							`omp-patch: advisor autoresume capped at ${MAX_CONSECUTIVE} consecutive continues`,
-							"warning",
-						);
-					}
-					return;
-				}
-
-				consecutive += 1;
-				lastTriggeredCardKey = key;
-				inFlight = true;
+			// Return the promise: ManagedTimers routes a rejected return value to the
+			// extension error channel. Notify is best-effort; rethrow keeps the
+			// original error visible to the host.
+			return fireAutoresume(ctx, notes, key).catch((err: unknown) => {
 				try {
 					if (ctx.hasUI) {
-						const theme = ctx.ui.theme;
-						ctx.ui.setStatus(
-							STATUS_KEY,
-							theme.fg("dim", `advisor autoresume · ${notes.map(n => n.severity).join("/")}`),
-						);
-						setTimeout(() => {
-							if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
-						}, 4_000);
+						ctx.ui.notify(`omp-patch: advisor autoresume failed: ${String(err)}`, "warning");
 					}
-
-					pi.sendMessage(
-						{
-							customType: "omp-patch-advisor-autoresume",
-							content: continuePrompt(notes),
-							display: true,
-							attribution: "agent",
-						},
-						{ triggerTurn: true, deliverAs: "nextTurn" },
-					);
-				} finally {
-					inFlight = false;
+				} catch {
+					// UI gone during teardown — rethrow below still reports.
 				}
-			})();
+				throw err;
+			});
 		}, DEBOUNCE_MS);
+	});
+
+	pi.on("session_shutdown", async (_event, _ctx) => {
+		consecutive = 0;
+		lastTerminalAnswerAt = 0;
+		lastTriggeredCardKey = undefined;
+		debounceTimer = undefined;
+		inFlight = false;
 	});
 }

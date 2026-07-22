@@ -1,6 +1,6 @@
 {
   "name": "omp-patch",
-  "version": "1.0.11",
+  "version": "1.0.12",
   "description": "oh-my-pi extension: stream retry + advisor UI + compact tools + advisor autoresume",
   "license": "MIT",
   "repository": {
@@ -29,6 +29,6 @@
     ]
   },
   "peerDependencies": {
-    "@oh-my-pi/pi-coding-agent": ">=16.5.2"
+    "@oh-my-pi/pi-coding-agent": ">=17.0.2"
   }
 }
