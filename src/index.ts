@@ -9,6 +9,9 @@
  * 3) Compact tool UI — Claude Code–style one-line tool results (Ctrl+O expands).
  * 4) Advisor autoresume — when omp preserves a concern/blocker card after a
  *    terminal text answer, auto-continue so the agent weighs and acts on it.
+ * 5) Goal magic sticky — re-inject ultrathink/orchestrate/workflowz notices on
+ *    goal turns when the objective contains those keywords (stock skips
+ *    goal-continuation).
  */
 import { statSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -20,6 +23,7 @@ import {
 	isCompactToolsEnabled,
 	toggleCompactTools,
 } from "./compact-tools.ts";
+import { installGoalMagicSticky } from "./goal-magic-sticky.ts";
 import { installStreamRetry, isTransientStreamFailure, lastAssistant } from "./stream-retry.ts";
 
 /** How long to keep "Advisor reviewing…" if no notes arrive (silent finish). */
@@ -138,6 +142,9 @@ export default async function ompPatch(pi: ExtensionAPI): Promise<void> {
 
 	// ——— advisor autoresume (preserved concern/blocker cards) ———
 	installAdvisorAutoresume(pi);
+
+	// ——— goal magic sticky (objective keywords survive continuations) ———
+	installGoalMagicSticky(pi);
 
 	// ——— transient stream retry ———
 	installStreamRetry(pi);

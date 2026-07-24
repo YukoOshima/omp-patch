@@ -1,6 +1,6 @@
 # omp-patch
 
-oh-my-pi extension that improves transient failure recovery and advisor visibility.
+oh-my-pi extension that improves transient failure recovery, advisor visibility, compact tool UI, and goal-mode magic-keyword stickiness.
 
 ## Stream retry
 
@@ -57,6 +57,26 @@ When omp 16.5.2+ **preserves** a `concern`/`blocker` card after the primary alre
 - **Skips:** live steered turns, plan mode, Esc/cancel preserves (no recent terminal answer), and caps at 3 consecutive autoresumes
 
 This does **not** replace `advisor.immuneTurns` tuning. Set `immuneTurns: 0` separately if dual advisors are cooldown-downgrading each other to asides.
+
+## Goal magic sticky
+
+Stock omp only injects `ultrathink` / `orchestrate` / `workflowz` notices when a **user** prompt contains the standalone keyword. Goal auto-continuations skip that path, so keywords in `/goal set …` would only fire once.
+
+This extension re-injects the matching notices on later goal turns when:
+
+- the **active** goal objective contains the keyword(s) (paused/dropped → off)
+- `magicKeywords.*` still allows them (unreadable config → no inject)
+- stock would **not** already inject on this turn (no double notice on the first auto-submit)
+- for `workflowz`: the `task` tool is active
+- main session only (keyed by session id; subagents never sticky-inject)
+
+No extra slash command — writing the keyword into the objective is the enable switch.
+
+Example:
+
+```text
+/goal set 研究 auth 存储路径 workflowz orchestrate；交付结构化地图与证据
+```
 
 ## Requirements
 
